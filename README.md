@@ -72,7 +72,7 @@ We implement:
 ## 🛠 Installation
 
 ```bash
-git clone https://github.com/yourusername/Metabolitics-Survival-Framework.git
-cd Metabolitics-Survival-Framework
+git clone https://github.com/itu-bioinformatics-database-lab/FluxPRS-HazardAnalysis.git
+cd FluxPRS-HazardAnalysis
 pip install -r requirements.txt
 ```
