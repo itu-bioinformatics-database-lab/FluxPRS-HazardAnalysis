@@ -2,3 +2,28 @@ DIABETES
 ROSMAP-AD
 MayoRNASeq-AD
 MayoRNASeq-PSP
+
+# Cohort data and generated outputs must not enter the public repository.
+data/
+raw/
+processed/
+results/
+plots/
+BMC_figures/
+BMC_tables/
+manuscript/
+hazard_rations/
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.xlsx
+*.xls
+*.docx
+
+# Local and notebook artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store

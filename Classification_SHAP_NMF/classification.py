@@ -14,6 +14,9 @@ Models
     Random Forest and Logistic Regression   (RFE-selected features and all features)
     Gradient Boosting, AdaBoost, Stacking   (RFE-selected features)
 
+    Stacking is omitted for participant-grouped cohorts because scikit-learn's
+    internal StackingClassifier CV does not accept participant groups.
+
 Evaluation protocol (nested cross-validation, no information leakage)
 ----------------------------------------------------------------------
     * Outer loop : stratified k-fold CV (default 5 folds). Metrics (accuracy,
@@ -43,16 +46,25 @@ from sklearn.ensemble import (AdaBoostClassifier, GradientBoostingClassifier,
 from sklearn.feature_selection import RFE
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
+from sklearn.impute import SimpleImputer
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
+
+try:
+    from .splitting import resolve_group_column, stratified_folds
+except ImportError:
+    from splitting import resolve_group_column, stratified_folds
 
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
 
 SEED = 42
-METADATA_COLS = ["sample_id", "Gender", "Race", "Diagnosis"]
+METADATA_COLS = [
+    "sample_id", "Sample ID", "Gender", "Race", "Diagnosis",
+    "participant_id", "Participant ID", "PatientID", "patient_id",
+    "Subject", "subject_id", "individual_id",
+]
 
 # Feature set name -> input file name
 FEATURE_SETS = {
@@ -74,15 +86,33 @@ FEATURE_GRID_ALL = list(range(20, 101, 10))      # all features
 # --------------------------------------------------------------------------
 # Data
 # --------------------------------------------------------------------------
-def load_dataset(path):
-    """Load a feature table and return X (DataFrame) and binary y (1 = AD)."""
+def load_dataset(path, group_column=None):
+    """Load features, labels and optional participant IDs."""
     df = pd.read_csv(path)
     df = df[df["Diagnosis"].isin(["AD", "Control"])].reset_index(drop=True)
+    resolved_group = resolve_group_column(df, group_column)
+    groups = (
+        df[resolved_group].astype(str).to_numpy()
+        if resolved_group is not None
+        else None
+    )
     # Identifier, label and demographic columns are not used as features
-    X = df.drop(columns=[c for c in METADATA_COLS if c in df.columns])
+    excluded = set(METADATA_COLS)
+    if resolved_group:
+        excluded.add(resolved_group)
+    X = df.drop(columns=[c for c in excluded if c in df.columns])
     X = X.select_dtypes(include=[np.number])
     y = df["Diagnosis"].map({"AD": 1, "Control": 0}).to_numpy()
-    return X, y
+    return X, y, groups, resolved_group
+
+
+def fit_preprocessor(X_train, X_test):
+    """Fit imputation and scaling on training rows only."""
+    imputer = SimpleImputer(strategy="median", keep_empty_features=True)
+    train_imputed = imputer.fit_transform(X_train)
+    test_imputed = imputer.transform(X_test)
+    scaler = StandardScaler().fit(train_imputed)
+    return scaler.transform(train_imputed), scaler.transform(test_imputed)
 
 
 # --------------------------------------------------------------------------
@@ -116,16 +146,18 @@ def rfe_ranking(X_train, y_train, k_max, coarse_step=0.1):
 # --------------------------------------------------------------------------
 # Models
 # --------------------------------------------------------------------------
-def build_models():
+def build_models(include_stacking=True):
     """Classifiers evaluated on the RFE-selected features."""
-    return {
+    models = {
         "Random Forest": lambda: RandomForestClassifier(n_estimators=100, random_state=SEED),
         "Logistic Regression": lambda: LogisticRegression(max_iter=1000, random_state=SEED),
         "Gradient Boosting": lambda: GradientBoostingClassifier(
             n_estimators=100, learning_rate=0.1, random_state=SEED),
         "AdaBoost": lambda: AdaBoostClassifier(
             n_estimators=100, learning_rate=1.0, random_state=SEED),
-        "Stacking Ensemble": lambda: StackingClassifier(
+    }
+    if include_stacking:
+        models["Stacking Ensemble"] = lambda: StackingClassifier(
             estimators=[
                 ("lr", LogisticRegression(max_iter=1000)),
                 ("rf", RandomForestClassifier(n_estimators=100, random_state=SEED)),
@@ -133,8 +165,8 @@ def build_models():
             ],
             final_estimator=LogisticRegression(),
             cv=5,
-        ),
-    }
+        )
+    return models
 
 
 def build_all_feature_models():
@@ -159,17 +191,17 @@ def evaluate(model, X_tr, y_tr, X_te, y_te):
 # --------------------------------------------------------------------------
 # Inner CV: choose the number of RFE features
 # --------------------------------------------------------------------------
-def select_n_features(X_train, y_train, grid, n_inner, metric):
+def select_n_features(X_train, y_train, grid, n_inner, metric, groups=None):
     """
     Choose the number of RFE-selected features by inner stratified CV using a
     Random Forest classifier. RFE is refitted on every inner training fold.
     """
     grid = [k for k in grid if k <= X_train.shape[1]] or [X_train.shape[1]]
-    inner = StratifiedKFold(n_splits=n_inner, shuffle=True, random_state=SEED)
     scores = {k: [] for k in grid}
-    for tr, va in inner.split(X_train, y_train):
-        scaler = StandardScaler().fit(X_train[tr])
-        Xtr, Xva = scaler.transform(X_train[tr]), scaler.transform(X_train[va])
+    for tr, va in stratified_folds(
+        y_train, n_splits=n_inner, seed=SEED, groups=groups
+    ):
+        Xtr, Xva = fit_preprocessor(X_train[tr], X_train[va])
         order = rfe_ranking(Xtr, y_train[tr], k_max=max(grid))
         for k in grid:
             sel = order[:k]
@@ -183,21 +215,31 @@ def select_n_features(X_train, y_train, grid, n_inner, metric):
 # --------------------------------------------------------------------------
 # Outer CV
 # --------------------------------------------------------------------------
-def run_feature_set(name, X, y, n_outer, n_inner, n_repeats, metric):
+def run_feature_set(name, X, y, groups, n_outer, n_inner, n_repeats, metric):
     grid = FEATURE_GRID_ALL if name == "All" else FEATURE_GRID_SMALL
     Xv = X.to_numpy(dtype=float)
-    outer = RepeatedStratifiedKFold(n_splits=n_outer, n_repeats=n_repeats, random_state=SEED)
+    grid = [k for k in grid if k <= Xv.shape[1]] or [Xv.shape[1]]
+    outer = []
+    for repeat in range(n_repeats):
+        outer.extend(
+            (repeat, tr, te)
+            for tr, te in stratified_folds(
+                y, n_splits=n_outer, seed=SEED + repeat, groups=groups
+            )
+        )
 
-    fold_rows, selected_rows = [], []
-    for fold, (tr, te) in enumerate(outer.split(Xv, y), start=1):
+    fold_rows, selected_rows, audit_rows = [], [], []
+    for fold, (repeat, tr, te) in enumerate(outer, start=1):
         log.info("[%s] outer fold %d/%d", name, fold, n_outer * n_repeats)
 
-        # 1) Scaling fitted on the outer training portion only
-        scaler = StandardScaler().fit(Xv[tr])
-        Xtr, Xte = scaler.transform(Xv[tr]), scaler.transform(Xv[te])
+        # 1) Imputation and scaling fitted on the outer training portion only
+        Xtr, Xte = fit_preprocessor(Xv[tr], Xv[te])
 
         # 2) Number of features chosen by inner CV on the outer training portion
-        k = select_n_features(Xv[tr], y[tr], grid, n_inner, metric)
+        inner_groups = groups[tr] if groups is not None else None
+        k = select_n_features(
+            Xv[tr], y[tr], grid, n_inner, metric, groups=inner_groups
+        )
 
         # 3) RFE refitted on the outer training portion; top-k features
         order = rfe_ranking(Xtr, y[tr], k_max=max(grid))
@@ -206,7 +248,10 @@ def run_feature_set(name, X, y, n_outer, n_inner, n_repeats, metric):
                            "feature": X.columns[i]} for r, i in enumerate(sel)]
 
         # 4) Models on RFE-selected features
-        for model_name, factory in build_models().items():
+        # StackingClassifier does not accept participant groups for its own
+        # internal CV. It is omitted for grouped cohorts rather than allowing
+        # repeated participants to cross those internal folds.
+        for model_name, factory in build_models(include_stacking=groups is None).items():
             res = evaluate(factory(), Xtr[:, sel], y[tr], Xte[:, sel], y[te])
             fold_rows.append({"feature_set": name, "model": model_name,
                               "features": "RFE", "n_features": k, "fold": fold, **res})
@@ -218,7 +263,26 @@ def run_feature_set(name, X, y, n_outer, n_inner, n_repeats, metric):
                               "features": "All", "n_features": Xv.shape[1],
                               "fold": fold, **res})
 
-    return pd.DataFrame(fold_rows), pd.DataFrame(selected_rows)
+        train_groups = set(groups[tr]) if groups is not None else set()
+        test_groups = set(groups[te]) if groups is not None else set()
+        audit_rows.append(
+            {
+                "feature_set": name,
+                "repeat": repeat,
+                "fold": fold,
+                "n_train_rows": len(tr),
+                "n_test_rows": len(te),
+                "n_train_participants": len(train_groups) if groups is not None else len(tr),
+                "n_test_participants": len(test_groups) if groups is not None else len(te),
+                "participant_overlap": len(train_groups & test_groups),
+            }
+        )
+
+    return (
+        pd.DataFrame(fold_rows),
+        pd.DataFrame(selected_rows),
+        pd.DataFrame(audit_rows),
+    )
 
 
 def summarise(folds):
@@ -247,25 +311,44 @@ def main():
     ap.add_argument("--selection-metric", default="accuracy",
                     choices=["accuracy", "f1", "auc"],
                     help="Inner-CV metric used to choose the number of RFE features")
+    ap.add_argument(
+        "--group-column",
+        default=None,
+        help=(
+            "Participant-ID column. When present, outer and inner folds are "
+            "participant-grouped. Common participant column names are detected automatically."
+        ),
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    all_folds, all_selected = [], []
+    all_folds, all_selected, all_audits = [], [], []
     for name in args.feature_sets:
         path = os.path.join(args.data_dir, FEATURE_SETS[name])
-        X, y = load_dataset(path)
+        X, y, groups, resolved_group = load_dataset(path, args.group_column)
         log.info("[%s] %d samples (%d AD, %d Control), %d features",
                  name, len(y), int(y.sum()), int((y == 0).sum()), X.shape[1])
-        folds, selected = run_feature_set(name, X, y, args.n_outer, args.n_inner,
-                                          args.n_repeats, args.selection_metric)
+        if groups is not None:
+            log.info(
+                "[%s] participant-grouped CV using %s (%d unique participants)",
+                name, resolved_group, len(np.unique(groups)),
+            )
+        folds, selected, audit = run_feature_set(
+            name, X, y, groups, args.n_outer, args.n_inner,
+            args.n_repeats, args.selection_metric
+        )
         all_folds.append(folds)
         all_selected.append(selected)
+        all_audits.append(audit)
 
     folds = pd.concat(all_folds, ignore_index=True)
     folds.to_csv(os.path.join(args.out_dir, "classification_fold_metrics.csv"), index=False)
     summarise(folds).to_csv(os.path.join(args.out_dir, "classification_summary.csv"), index=False)
     pd.concat(all_selected, ignore_index=True).to_csv(
         os.path.join(args.out_dir, "rfe_selected_features_per_fold.csv"), index=False)
+    pd.concat(all_audits, ignore_index=True).to_csv(
+        os.path.join(args.out_dir, "split_audit.csv"), index=False
+    )
     log.info("Results written to %s", args.out_dir)
 
 

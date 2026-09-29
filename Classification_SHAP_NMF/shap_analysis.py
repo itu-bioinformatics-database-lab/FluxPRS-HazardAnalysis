@@ -5,9 +5,10 @@ SHAP-based interpretation of the RFE-selected Random Forest classifier
 
 Protocol
 --------
-    1. ROSMAP AD / Control samples are split into a training partition (70%)
-       and a held-out test partition (30%) by stratified sampling
-       (random_state = 42).
+    1. Samples are split into a training partition (70%) and a held-out test
+       partition (30%) by stratified sampling (random_state = 42). When a
+       participant identifier is supplied or detected, splitting is grouped
+       so repeated observations from one participant cannot cross partitions.
     2. On the training partition only:
          - missing values are imputed with training-partition medians;
          - features are standardised (StandardScaler);
@@ -18,7 +19,8 @@ Protocol
          - SHAP values are computed (TreeExplainer, positive class = AD);
          - the direction of each feature's effect is derived from the sign of
            the correlation between feature values and SHAP values;
-         - Welch's t-tests compare AD and Control for the top-ranked features;
+         - group means and standard deviations are reported descriptively for
+           top-ranked features; no post-selection p-values are computed;
          - error symmetry is assessed with McNemar's test (continuity correction).
          
 """
@@ -37,9 +39,14 @@ from matplotlib.lines import Line2D
 from scipy import stats
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import RFE
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import confusion_matrix
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+try:
+    from .splitting import holdout_split, resolve_group_column
+except ImportError:
+    from splitting import holdout_split, resolve_group_column
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -50,28 +57,39 @@ POS_COLOR, NEG_COLOR = "#e74c3c", "#3498db"
 
 # Columns that are never used as features
 NON_FEATURE_COLS = ["Diagnosis", "SampleID", "Sample_ID", "sample_id", "ID", "id",
-                    "PatientID", "patient_id", "Subject", "subject_id"]
+                    "PatientID", "patient_id", "Subject", "subject_id",
+                    "participant_id", "Participant ID", "individual_id"]
 DEMOGRAPHIC_COLS = ["Gender", "Race"]
 
 
 # --------------------------------------------------------------------------
 # Data preparation (all fitted steps use the training partition only)
 # --------------------------------------------------------------------------
-def prepare_data(path, test_size, n_features, exclude_demographics):
+def prepare_data(path, test_size, n_features, exclude_demographics, group_column=None):
     df = pd.read_csv(path)
     df = df[df["Diagnosis"].isin(["AD", "Control"])].reset_index(drop=True)
     y = (df["Diagnosis"] == "AD").astype(int).to_numpy()
+    resolved_group = resolve_group_column(df, group_column)
+    groups = (
+        df[resolved_group].astype(str).to_numpy()
+        if resolved_group is not None
+        else None
+    )
 
     drop = [c for c in NON_FEATURE_COLS if c in df.columns]
+    if resolved_group and resolved_group not in drop:
+        drop.append(resolved_group)
     if exclude_demographics:
         drop += [c for c in DEMOGRAPHIC_COLS if c in df.columns]
     X = df.drop(columns=drop).select_dtypes(include=[np.number])
 
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, random_state=SEED, stratify=y)
+    tr, te = holdout_split(y, test_size=test_size, seed=SEED, groups=groups)
+    X_tr, X_te = X.iloc[tr].copy(), X.iloc[te].copy()
+    y_tr, y_te = y[tr], y[te]
 
-    medians = X_tr.median(numeric_only=True)
-    X_tr, X_te = X_tr.fillna(medians), X_te.fillna(medians)
+    imputer = SimpleImputer(strategy="median", keep_empty_features=True)
+    X_tr = pd.DataFrame(imputer.fit_transform(X_tr), columns=X.columns)
+    X_te = pd.DataFrame(imputer.transform(X_te), columns=X.columns)
 
     scaler = StandardScaler().fit(X_tr)
     X_tr = pd.DataFrame(scaler.transform(X_tr), columns=X.columns)
@@ -81,7 +99,17 @@ def prepare_data(path, test_size, n_features, exclude_demographics):
               n_features_to_select=n_features, step=0.1).fit(X_tr, y_tr)
     selected = X_tr.columns[rfe.support_].tolist()
 
-    return X_tr[selected], X_te[selected], y_tr, y_te, selected
+    audit = {
+        "group_column": resolved_group,
+        "n_train_rows": len(tr),
+        "n_test_rows": len(te),
+        "n_train_participants": len(np.unique(groups[tr])) if groups is not None else len(tr),
+        "n_test_participants": len(np.unique(groups[te])) if groups is not None else len(te),
+        "participant_overlap": (
+            len(set(groups[tr]) & set(groups[te])) if groups is not None else 0
+        ),
+    }
+    return X_tr[selected], X_te[selected], y_tr, y_te, selected, audit
 
 
 def positive_class_shap(values):
@@ -146,15 +174,26 @@ def plot_confusion_matrix(cm, path):
     plt.close(fig)
 
 
-def welch_ttests(X_df, y, features):
+def group_summaries(X_df, y, features):
+    """Descriptive summaries; avoids post-selection tests on the test set."""
     rows = []
     for f in features:
         a, b = X_df.loc[y == 1, f], X_df.loc[y == 0, f]
-        t, p = stats.ttest_ind(a, b, equal_var=False)
-        rows.append({"feature": f, "t_statistic": t, "p_value": p,
-                     "direction_in_AD": "Up-regulated" if a.mean() > b.mean() else "Down-regulated",
-                     "significant_0.05": p < 0.05})
-    return pd.DataFrame(rows).sort_values("p_value")
+        rows.append(
+            {
+                "feature": f,
+                "ad_n": len(a),
+                "ad_mean": a.mean(),
+                "ad_sd": a.std(ddof=1),
+                "control_n": len(b),
+                "control_mean": b.mean(),
+                "control_sd": b.std(ddof=1),
+                "direction_in_ad": (
+                    "higher" if a.mean() > b.mean() else "lower"
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def mcnemar_corrected(cm):
@@ -178,11 +217,21 @@ def main():
     ap.add_argument("--top-n-summary", type=int, default=20, help="Features in the SHAP summary plot")
     ap.add_argument("--exclude-demographics", action="store_true",
                     help="Also exclude Gender and Race columns from the feature set")
+    ap.add_argument(
+        "--group-column",
+        default=None,
+        help=(
+            "Participant-ID column. Repeated observations from one participant "
+            "are kept in one partition; common names are detected automatically."
+        ),
+    )
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    X_tr, X_te, y_tr, y_te, features = prepare_data(
-        args.input, args.test_size, args.n_features, args.exclude_demographics)
+    X_tr, X_te, y_tr, y_te, features, split_audit = prepare_data(
+        args.input, args.test_size, args.n_features, args.exclude_demographics,
+        args.group_column,
+    )
     log.info("Training: %d (%d AD, %d Control) | Test: %d (%d AD, %d Control)",
              len(y_tr), y_tr.sum(), (y_tr == 0).sum(), len(y_te), y_te.sum(), (y_te == 0).sum())
 
@@ -203,9 +252,11 @@ def main():
     plot_directional_bar(importance, args.top_n,
                          os.path.join(args.out_dir, "supp_fig6_shap_bar_test.png"))
 
-    # Welch's t-tests on the test partition, top-ranked SHAP features
-    welch_ttests(X_te, y_te, importance["feature"].head(args.top_n)).to_csv(
-        os.path.join(args.out_dir, "ttests_top_features_test.csv"), index=False)
+    # Descriptive summaries only. Features were ranked using held-out SHAP
+    # values, so inferential tests on the same rows would be post-selection.
+    group_summaries(X_te, y_te, importance["feature"].head(args.top_n)).to_csv(
+        os.path.join(args.out_dir, "feature_group_summary_test.csv"), index=False
+    )
 
     # Confusion matrix and McNemar's test on the test partition (Supplementary Figure 7)
     cm = confusion_matrix(y_te, model.predict(X_te), labels=[0, 1])
@@ -219,6 +270,9 @@ def main():
 
     pd.Series(features, name="feature").to_csv(
         os.path.join(args.out_dir, "rfe_selected_features.csv"), index=False)
+    pd.DataFrame([split_audit]).to_csv(
+        os.path.join(args.out_dir, "split_audit.csv"), index=False
+    )
     log.info("Results written to %s", args.out_dir)
 
 
