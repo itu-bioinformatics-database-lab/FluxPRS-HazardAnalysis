@@ -27,3 +27,5 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 .DS_Store
+# PRSice log dumps
+prs_prep/**/output_log.txt

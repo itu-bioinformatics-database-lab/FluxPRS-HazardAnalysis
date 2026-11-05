@@ -1,55 +1,51 @@
 # FluxPRS-HazardAnalysis
 
-A reproducible framework for survival analysis and disease classification
-using metabolomics, polygenic risk scores (PRS), and Metabolitics-derived
-reaction/pathway perturbation scores.
+Code for integrating polygenic risk scores (PRS) with metabolomics and
+Metabolitics-derived reaction and pathway perturbation scores, as reported in
+the BMC Bioinformatics manuscript.
 
-## Analyses
+Public repository: https://github.com/itu-bioinformatics-database-lab/FluxPRS-HazardAnalysis
 
-- Cox proportional-hazards models and hazard-ratio comparisons
-- PRS-only, omics-only, and integrated multi-omics configurations
-- Nested cross-validated classification
-- Held-out SHAP interpretation
-- Train-fitted NMF with held-out projection
+This working copy may include access-controlled cohort files. Those files are
+not part of the public repository.
 
-## Data-leakage controls
+## Manuscript analyses
 
-The public workflow is designed so evaluation rows cannot influence model
-training or preprocessing.
+The reported analyses live in `scripts/`, `modules/`, `preprocessing/`, and
+`tests/`. Older `notebooks/`, `analysis/`, and `Classification_SHAP_NMF/`
+files are retained for reference and are not the leakage-controlled pipeline
+described in Methods.
 
-1. **Participant grouping.** Repeated observations from the same participant
-   must remain in one partition. Common participant-ID columns are detected
-   automatically, or can be supplied with `--group-column`. This is required
-   for DiCAD, where multiple samples can belong to one participant.
-2. **Training-only preprocessing.** Missing-value imputation, scaling,
-   feature ranking, RFE/RFECV, and model fitting are fitted only on the
-   relevant training partition. Validation/test rows are transformed with
-   those fitted objects.
-3. **Nested model selection.** Classification feature counts are selected in
-   inner folds and evaluated in untouched outer folds. Cross-validation folds
-   are not treated as independent biological replicates.
-4. **Held-out interpretation.** SHAP values are computed only after fitting
-   the model and feature selection on the training partition. Features ranked
-   on held-out SHAP values receive descriptive group summaries only; the same
-   test rows are not reused for post-selection significance tests.
-5. **Train-fitted NMF.** Supervised feature selection, scaling, rank
-   diagnostics, and NMF fitting use training rows only. Test samples are
-   projected with `NMF.transform`; the factorization is not refitted.
-6. **Split audits.** Classification, SHAP, and NMF commands write
-   `split_audit.csv`, including participant counts and overlap. Any detected
-   participant overlap raises an error.
+| Reported analysis | Script |
+| --- | --- |
+| 70/30 splits (DiCAD grouped by participant) | `scripts/prepare_cohort_splits.py`, `preprocessing/cohort_splits.py` |
+| Metabolitics train-fit / holdout-transform | `scripts/metabolitics/run_cohort_metabolitics.py` |
+| Nested classification and held-out test metrics | `scripts/run_notebook_classifiers.py` |
+| Nested CV table (Supplementary Table 2) and held-out table (Supplementary Table 3) | `scripts/render_nested_classification_table.py` |
+| Cox hazard ratios on concatenated train+test scores | `scripts/run_cox_hrs.py` |
+| SHAP on the held-out partition | `scripts/run_train_cv.py` |
+| Pathway RFECV, McNemar, and train-fitted NMF | `scripts/run_clf_extras.py` |
+| PRS variant-matching figure | `scripts/assemble_prs_matching_figure.py` |
+| Main-text and supplementary figures | `scripts/assemble_bmc_figures.py`, `scripts/assemble_supplementary_figures.py` |
+| Evaluation manifest | `scripts/collect_evaluation_results.py` |
 
-For cohorts with one row per participant, stratified sample-level splitting
-is used when no participant column exists. For repeated-measure cohorts,
-provide a participant identifier; do not substitute the sample identifier.
+Do not copy cohort `raw/` or `processed/` directories, `incoming/`, or any
+participant-level files into the public repository.
 
-## Input modalities
+## Protocol (matches Methods)
 
-1. Metabolite levels
-2. Polygenic risk scores
-3. Reaction differential scores
-4. Pathway differential scores
-5. Combined multi-omics matrices
+1. Use the saved 70/30 splits (`random_state=42`). DiCAD is split by participant.
+2. Fit Metabolitics on training rows only and transform held-out or validation
+   rows (`fit_train_transform_holdout`). Nested-classification outer folds use
+   independently generated Metabolitics matrices.
+3. Nested 5×5 classification: inner folds choose the number of Random-Forest-ranked
+   features; inner folds reuse the outer-training Metabolitics matrix.
+4. Cox models use scores from the concatenated training and test samples after
+   the logistic risk models are fitted on training diagnoses only. PRS-only
+   scores are defined externally. These comparisons are associations with
+   disease status and do not establish incremental value over PRS alone.
+5. Nested cross-validation is the primary classification evidence. Held-out
+   metrics are the already-computed 30% test evaluation of the same models.
 
 ## Installation
 
@@ -59,32 +55,19 @@ cd FluxPRS-HazardAnalysis
 python -m pip install -r requirements.txt
 ```
 
-## Leakage-safe classification
+## Reproducing reported analyses
 
-Input files are expected under `data/` by default. Raw and processed cohort
-data are intentionally excluded from this public repository.
-
-```bash
-python Classification_SHAP_NMF/classification.py \
-  --data-dir data \
-  --out-dir results/classification \
-  --n-outer 5 \
-  --n-inner 5
-```
-
-For a repeated-measure cohort:
+Place access-controlled cohort files in the internal layout (`ROSMAP-AD/`,
+`MayoRNASeq-AD/`, `MayoRNASeq-PSP/`, `DIABETES/`), then:
 
 ```bash
-python Classification_SHAP_NMF/classification.py \
-  --data-dir data \
-  --group-column participant_id
+python scripts/prepare_cohort_splits.py
+# Metabolitics FVA: scripts/metabolitics/run_cohort_metabolitics.py
+python scripts/run_cox_hrs.py
+python scripts/run_notebook_classifiers.py
+python scripts/run_train_cv.py
+python scripts/run_clf_extras.py
+python scripts/render_nested_classification_table.py
+python scripts/collect_evaluation_results.py
+python -m pytest tests
 ```
-
-The same `--group-column` option is available in `shap_analysis.py` and
-`nmf_analysis.py`.
-
-## Public-data policy
-
-This repository contains analysis code only. Cohort-level source data,
-sample-level predictions, participant identifiers, private manuscript files,
-and generated result directories must not be committed.
