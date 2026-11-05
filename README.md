@@ -9,12 +9,10 @@ Public repository: https://github.com/itu-bioinformatics-database-lab/FluxPRS-Ha
 This working copy may include access-controlled cohort files. Those files are
 not part of the public repository.
 
-## Manuscript analyses
+## Reported analyses
 
 The reported analyses live in `scripts/`, `modules/`, `preprocessing/`, and
-`tests/`. Older `notebooks/`, `analysis/`, and `Classification_SHAP_NMF/`
-files are retained for reference and are not the leakage-controlled pipeline
-described in Methods.
+`tests/`. Unused legacy notebooks and earlier analysis modules are in `.archive/`.
 
 | Reported analysis | Script |
 | --- | --- |
