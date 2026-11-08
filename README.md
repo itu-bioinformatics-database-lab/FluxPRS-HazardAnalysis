@@ -21,6 +21,7 @@ The reported analyses live in `scripts/`, `modules/`, `preprocessing/`, and
 | Nested classification and held-out test metrics | `scripts/run_notebook_classifiers.py` |
 | Nested CV table (Supplementary Table 2) and held-out table (Supplementary Table 3) | `scripts/render_nested_classification_table.py` |
 | Cox hazard ratios on concatenated train+test scores | `scripts/run_cox_hrs.py` |
+| Table 2 ΔHR summaries (median ΔHR; positive / zero / negative counts) | `scripts/summarize_delta_hr.py` |
 | SHAP on the held-out partition | `scripts/run_train_cv.py` |
 | Pathway RFECV, McNemar, and train-fitted NMF | `scripts/run_clf_extras.py` |
 | PRS variant-matching figure | `scripts/assemble_prs_matching_figure.py` |
@@ -62,6 +63,7 @@ Place access-controlled cohort files in the internal layout (`ROSMAP-AD/`,
 python scripts/prepare_cohort_splits.py
 # Metabolitics FVA: scripts/metabolitics/run_cohort_metabolitics.py
 python scripts/run_cox_hrs.py
+python scripts/summarize_delta_hr.py
 python scripts/run_notebook_classifiers.py
 python scripts/run_train_cv.py
 python scripts/run_clf_extras.py
